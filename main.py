@@ -315,6 +315,13 @@ async def execute_order(request: ExecuteRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ===== 공개 핑 (Railway 헬스체크용 — 인증 불필요) =====
+
+@app.get("/ping")
+async def ping():
+    return {"status": "ok"}
+
+
 # ===== 헬스체크 =====
 
 @app.get("/health")
