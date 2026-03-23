@@ -36,6 +36,9 @@ class AgentExchangeClient:
 
     def __init__(self, exchange_id: str, api_key: str, api_secret: str, api_passphrase: str = ""):
         self.exchange_id = exchange_id.lower()
+        self._api_key = api_key
+        self._api_secret = api_secret
+        self._api_passphrase = api_passphrase
 
         exchange_class = getattr(ccxt, self.exchange_id)
         exchange_config = {
@@ -74,6 +77,18 @@ class AgentExchangeClient:
             base = symbol[:-4]
             return f"{base}/USDT:USDT"
         return symbol
+
+    def _new_exchange(self) -> ccxt.Exchange:
+        """신규 ccxt 인스턴스 생성 — Bitget 단방향 SL/TP용 (캐시된 posMode 오판 방지)"""
+        exchange_class = getattr(ccxt, self.exchange_id)
+        config: dict = {
+            "apiKey": self._api_key,
+            "secret": self._api_secret,
+            "options": {"defaultType": "future"},
+        }
+        if self._api_passphrase:
+            config["password"] = self._api_passphrase
+        return exchange_class(config)
 
     async def _ensure_markets(self):
         if not self._markets_loaded:
@@ -301,10 +316,22 @@ class AgentExchangeClient:
             rounded_qty = self.round_quantity(symbol, qty)
             rounded_price = self.round_price(symbol, price)
             ccxt_symbol = self._to_ccxt_symbol(symbol)
-            order = await self.exchange.create_order(
-                ccxt_symbol, "limit", side.lower(), float(rounded_qty), float(rounded_price),
-                {"reduceOnly": True, "timeInForce": "GTC"}
-            )
+            if self.exchange_id == "bitget":
+                # 단방향 모드: 신규 인스턴스로 holdSide 오판 방지
+                ex = self._new_exchange()
+                try:
+                    await ex.load_markets()
+                    order = await ex.create_order(
+                        ccxt_symbol, "limit", side.lower(), float(rounded_qty), float(rounded_price),
+                        {"reduceOnly": True, "timeInForce": "GTC"}
+                    )
+                finally:
+                    await ex.close()
+            else:
+                order = await self.exchange.create_order(
+                    ccxt_symbol, "limit", side.lower(), float(rounded_qty), float(rounded_price),
+                    {"reduceOnly": True, "timeInForce": "GTC"}
+                )
             order_id = order["id"]
             logger.info(f"TP order placed: {side} {rounded_qty} {symbol} @ {rounded_price} (ID: {order_id})")
             return order_id
@@ -339,16 +366,23 @@ class AgentExchangeClient:
                     "positionIdx": 0,
                 })
             elif self.exchange_id == "bitget":
-                ccxt_symbol = self._to_ccxt_symbol(symbol)
+                # 단방향 모드: 신규 exchange 인스턴스로 holdSide 오판 방지
+                # 방향은 side로만, reduceOnly 필수
                 position = await self.get_position(symbol)
                 if not position:
                     logger.warning(f"No position found to set SL for {symbol}")
                     return False
-                close_side = "sell" if position.side == "LONG" else "buy"
-                await self.exchange.create_order(
-                    ccxt_symbol, "stop_market", close_side, float(position.qty), None,
-                    {"stopPrice": float(rounded_sl), "reduceOnly": True}
-                )
+                ccxt_symbol = self._to_ccxt_symbol(symbol)
+                sl_side = "sell" if position.side == "LONG" else "buy"
+                ex = self._new_exchange()
+                try:
+                    await ex.load_markets()
+                    await ex.create_order(
+                        ccxt_symbol, "stop_market", sl_side, float(position.qty), None,
+                        {"stopPrice": float(rounded_sl), "reduceOnly": True}
+                    )
+                finally:
+                    await ex.close()
             else:
                 ccxt_symbol = self._to_ccxt_symbol(symbol)
                 position = await self.get_position(symbol)
@@ -388,6 +422,25 @@ class AgentExchangeClient:
             await self._ensure_markets()
             ccxt_symbol = self._to_ccxt_symbol(symbol)
             await self.exchange.cancel_all_orders(ccxt_symbol)
+
+            if self.exchange_id == "bitget":
+                # ccxt cancel_all_orders는 일반 주문만 취소 — plan(stop/SL) 주문은 별도 처리
+                try:
+                    plan_orders = await self.exchange.fetch_open_orders(
+                        ccxt_symbol, params={"isPlan": "plan"}
+                    )
+                    for order in plan_orders:
+                        try:
+                            await self.exchange.cancel_order(
+                                order["id"], ccxt_symbol, params={"isPlan": "plan"}
+                            )
+                        except Exception as ce:
+                            logger.warning(f"Failed to cancel plan order {order['id']}: {ce}")
+                    if plan_orders:
+                        logger.info(f"Cancelled {len(plan_orders)} plan orders for {symbol}")
+                except Exception as pe:
+                    logger.warning(f"Failed to fetch/cancel plan orders for {symbol}: {pe}")
+
             logger.info(f"All open orders cancelled for {symbol}")
             return True
         except Exception as e:
